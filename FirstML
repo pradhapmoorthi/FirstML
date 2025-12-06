@@ -1,0 +1,208 @@
+
+# =========================
+# Imports & configuration
+# =========================
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow import keras
+
+AUTOTUNE = tf.data.AUTOTUNE
+tf.random.set_seed(42)
+
+# =========================
+# Constants from snippets
+# =========================
+IMG_HEIGHT = 224
+IMG_WIDTH  = 224
+IMG_CHANNELS = 3
+
+# We keep both TF tensor (for label mapping in tf graph ops) and Python list (for display)
+CLASS_NAMES_LIST = ["daisy", "dandelion", "roses", "sunflowers", "tulips"]
+CLASS_NAMES_TF   = tf.constant(CLASS_NAMES_LIST)
+
+# =========================
+# I/O: CSV locations (from snippet using GCS)
+# =========================
+TRAIN_CSV = "gs://cloud-ml-data/img/flower_photos/train_set.csv"
+EVAL_CSV  = "gs://cloud-ml-data/img/flower_photos/eval_set.csv"
+
+# If you want to run locally, set TRAIN_CSV/EVAL_CSV to local paths.
+
+# =========================
+# Image reading & parsing
+# =========================
+def read_and_decode(filename, resize_dims):
+    # 1) Read file
+    img_bytes = tf.io.read_file(filename)
+    # 2) Decode JPEG with required number of channels
+    img = tf.image.decode_jpeg(img_bytes, channels=IMG_CHANNELS)
+    # 3) Convert to [0,1] float
+    img = tf.image.convert_image_dtype(img, tf.float32)
+    # 4) Resize
+    img = tf.image.resize(img, resize_dims)
+    return img
+
+def parse_csvline(csv_line):
+    # record_defaults specify data types for each CSV column
+    record_defaults = ["", ""]  # filename, label_string
+    filename, label_string = tf.io.decode_csv(csv_line, record_defaults)
+
+    # Load & preprocess image
+    img = read_and_decode(filename, [IMG_HEIGHT, IMG_WIDTH])
+
+    # Convert label string to integer index by matching CLASS_NAMES
+    # tf.equal produces a boolean vector; argmax finds the index of True
+    label = tf.argmax(tf.cast(tf.equal(CLASS_NAMES_TF, label_string), tf.int32), axis=0, output_type=tf.int32)
+
+    return img, label
+
+# =========================
+# Build tf.data Datasets
+# =========================
+BATCH_SIZE = 16
+
+train_dataset = (
+    tf.data.TextLineDataset(TRAIN_CSV)
+      .map(parse_csvline, num_parallel_calls=AUTOTUNE)
+      .shuffle(1000, reshuffle_each_iteration=True)
+      .batch(BATCH_SIZE)
+      .prefetch(AUTOTUNE)
+)
+
+eval_dataset = (
+    tf.data.TextLineDataset(EVAL_CSV)
+      .map(parse_csvline, num_parallel_calls=AUTOTUNE)
+      .batch(BATCH_SIZE)
+      .prefetch(AUTOTUNE)
+)
+
+# =========================
+# Quick batch inspection (shapes & labels)
+# =========================
+for image_batch, label_batch in train_dataset.take(1):
+    print("Image batch shape:", image_batch.shape)
+    print("Label batch shape:", label_batch.shape)
+    print("Labels:", label_batch.numpy())
+
+# =========================
+# Visualization: show first image from two batches
+# =========================
+for image_batch, label_batch in train_dataset.take(2):
+    first_image = image_batch[0]
+    first_label = label_batch[0]
+    plt.imshow(first_image.numpy())
+    plt.title(f"Label: {CLASS_NAMES_LIST[int(first_label.numpy())]}")
+    plt.axis('off')
+    plt.show()
+
+# =========================
+# Visualization: 4x4 grid (16 images) from a batch
+# =========================
+for image_batch, label_batch in train_dataset.take(1):
+    fig, axes = plt.subplots(4, 4, figsize=(10, 10))
+    for i in range(16):
+        ax = axes[i // 4, i % 4]
+        ax.imshow(image_batch[i].numpy())
+        ax.set_title(f"Label: {CLASS_NAMES_LIST[int(label_batch[i].numpy())]}")
+        ax.axis("off")
+    plt.tight_layout()
+    plt.show()
+
+# =========================
+# Model: Flatten + Dense (from your snippet)
+# =========================
+model = keras.Sequential([
+    keras.layers.Flatten(input_shape=(IMG_HEIGHT, IMG_WIDTH, IMG_CHANNELS)),
+    keras.layers.Dense(len(CLASS_NAMES_LIST), activation="softmax")
+])
+
+model.compile(
+    optimizer="adam",
+    loss=keras.losses.SparseCategoricalCrossentropy(from_logits=False),
+    metrics=["accuracy"]
+)
+
+# =========================
+# Train
+# =========================
+EPOCHS = 10
+history = model.fit(
+    train_dataset,
+    validation_data=eval_dataset,
+    epochs=EPOCHS
+)
+
+# =========================
+# Confusion Matrix (counts + normalized)
+# =========================
+def plot_confusion_matrix(matrix, class_names, title="Confusion Matrix", normalize=False):
+    fig, ax = plt.subplots(figsize=(8, 6))
+    im = ax.imshow(matrix, cmap="Blues")
+    ax.set_title(title)
+    ax.set_xlabel("Predicted label")
+    ax.set_ylabel("True label")
+    ax.set_xticks(np.arange(len(class_names)))
+    ax.set_yticks(np.arange(len(class_names)))
+    ax.set_xticklabels(class_names, rotation=45, ha="right")
+    ax.set_yticklabels(class_names)
+    fmt = ".2f" if normalize else "d"
+    thresh = matrix.max() / 2.0 if matrix.size > 0 else 0.0
+    for i in range(matrix.shape[0]):
+        for j in range(matrix.shape[1]):
+            ax.text(j, i, format(matrix[i, j], fmt),
+                    ha="center", va="center",
+                    color="white" if matrix[i, j] > thresh else "black")
+    fig.colorbar(im, ax=ax)
+    plt.tight_layout()
+    plt.show()
+
+# Collect predictions on eval set
+y_true, y_pred = [], []
+for images, labels in eval_dataset:
+    probs = model.predict(images, verbose=0)
+    preds = tf.argmax(probs, axis=1).numpy()
+    y_pred.extend(preds)
+    y_true.extend(labels.numpy())
+
+y_true = np.array(y_true)
+y_pred = np.array(y_pred)
+
+cm = tf.math.confusion_matrix(
+    y_true, y_pred, num_classes=len(CLASS_NAMES_LIST)
+).numpy()
+
+cm_norm = cm.astype(np.float32) / np.maximum(cm.sum(axis=1, keepdims=True), 1)
+
+print(f"Validation accuracy (quick): {np.mean(y_true == y_pred):.4f}")
+plot_confusion_matrix(cm, CLASS_NAMES_LIST, title="Confusion Matrix (Counts)", normalize=False)
+plot_confusion_matrix(cm_norm, CLASS_NAMES_LIST, title="Confusion Matrix (Row-Normalized)", normalize=True)
+
+# =========================
+# Predict on validation & visualize grid with Pred vs Actual
+# =========================
+for images, labels in eval_dataset.take(1):
+    probs = model.predict(images, verbose=0)
+    predicted_indices = tf.argmax(probs, axis=1).numpy()
+
+    num_images = len(images)
+    num_cols = 4
+    num_rows = math.ceil(num_images / num_cols)
+
+    plt.figure(figsize=(12, 3 * num_rows))
+    for i in range(num_images):
+        plt.subplot(num_rows, num_cols, i + 1)
+        plt.imshow(images[i].numpy())
+        plt.axis('off')
+
+        pred_idx = int(predicted_indices[i])
+        true_idx = int(labels[i].numpy())
+        pred_class = CLASS_NAMES_LIST[pred_idx]
+        actual_class = CLASS_NAMES_LIST[true_idx]
+        pred_conf = float(probs[i][pred_idx])
+
+        plt.title(f"Pred: {pred_class} ({pred_conf:.2f})\nActual: {actual_class}", fontsize=10)
+
+    plt.tight_layout()
+    plt.show()
